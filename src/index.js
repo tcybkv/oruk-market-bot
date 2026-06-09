@@ -6,25 +6,46 @@ import {
 } from './db.js';
 import {
     mainMenu, categoriesKeyboard, productKeyboard,
-    shopKeyboard, paginationKeyboard
+    shopKeyboard
 } from './keyboards.js';
 import { formatProduct, formatVendor, formatProductList, escMd } from './messages.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// Сессия для хранения состояния пользователя
 bot.use(session({ defaultSession: () => ({ state: null, query: null, category: null, shopSlug: null }) }));
 
 // ─────────────────────────────────────────────
 // СТАРТ
 // ─────────────────────────────────────────────
 bot.start(async (ctx) => {
+    const payload = ctx.startPayload;
     ctx.session = { state: null, query: null, category: null, shopSlug: null };
-    await ctx.reply(
-        `👋 Привет\\! Добро пожаловать в *Oruk Market* — маркетплейс Кыргызстана\\.\n\n` +
-        `Здесь вы можете найти товары от проверенных продавцов и перейти на сайт для оформления заказа\\.\n\n` +
-        `Выберите действие:`,
-        { parse_mode: 'MarkdownV2', ...mainMenu }
+
+    // Пришёл по ссылке магазина: t.me/botname?start=shop_my-store
+    if (payload && payload.startsWith('shop_')) {
+        const slug = payload.replace('shop_', '');
+        ctx.session.shopSlug = slug;
+        ctx.session.state = 'shop_mode';
+        await sendShopWelcome(ctx, slug);
+        return;
+    }
+
+    // Обычный старт
+    await ctx.replyWithPhoto(
+        { url: `${process.env.SITE_URL}/og-image.png` },
+        {
+            caption:
+                `👋 Привет\\! Добро пожаловать в *Oruk Market*\n\n` +
+                `🛍 Маркетплейс Кыргызстана — товары от проверенных продавцов\\.\n\n` +
+                `Выберите действие:`,
+            parse_mode: 'MarkdownV2',
+            ...mainMenu
+        }
+    ).catch(() =>
+        ctx.reply(
+            `👋 Привет\\! Добро пожаловать в *Oruk Market* — маркетплейс Кыргызстана\\.\n\nВыберите действие:`,
+            { parse_mode: 'MarkdownV2', ...mainMenu }
+        )
     );
 });
 
@@ -46,15 +67,10 @@ bot.help(async (ctx) => {
 bot.hears('🛍 Каталог', async (ctx) => {
     ctx.session.state = 'catalog';
     const categories = await getCategories();
-
     if (categories.length === 0) {
         return ctx.reply('😔 Категории пока не добавлены\\.', { parse_mode: 'MarkdownV2', ...mainMenu });
     }
-
-    await ctx.reply(
-        '📂 *Выберите категорию:*',
-        { parse_mode: 'MarkdownV2', ...categoriesKeyboard(categories) }
-    );
+    await ctx.reply('📂 *Выберите категорию:*', { parse_mode: 'MarkdownV2', ...categoriesKeyboard(categories) });
 });
 
 // ─────────────────────────────────────────────
@@ -62,10 +78,7 @@ bot.hears('🛍 Каталог', async (ctx) => {
 // ─────────────────────────────────────────────
 bot.hears('🔍 Поиск товаров', async (ctx) => {
     ctx.session.state = 'awaiting_search';
-    await ctx.reply(
-        '🔍 Введите название товара для поиска:',
-        Markup.keyboard([['⬅️ Главное меню']]).resize()
-    );
+    await ctx.reply('🔍 Введите название товара для поиска:', Markup.keyboard([['⬅️ Главное меню']]).resize());
 });
 
 // ─────────────────────────────────────────────
@@ -90,21 +103,46 @@ bot.hears('📞 Поддержка', async (ctx) => {
 });
 
 // ─────────────────────────────────────────────
+// SHOP MODE — кнопки внутри режима магазина
+// ─────────────────────────────────────────────
+bot.hears('📦 Товары магазина', async (ctx) => {
+    if (ctx.session.shopSlug) {
+        await sendShopProducts(ctx, ctx.session.shopSlug, 0);
+    }
+});
+
+bot.hears('🛍 Все магазины', async (ctx) => {
+    ctx.session.state = 'shops';
+    await sendVendorsList(ctx, 0);
+});
+
+// ─────────────────────────────────────────────
 // ГЛАВНОЕ МЕНЮ
 // ─────────────────────────────────────────────
 bot.hears('⬅️ Главное меню', async (ctx) => {
     ctx.session = { state: null, query: null, category: null, shopSlug: null };
-    await ctx.reply('Главное меню:', mainMenu);
+    await ctx.reply(
+        `👋 Добро пожаловать в *Oruk Market*\\!\n\nВыберите действие:`,
+        { parse_mode: 'MarkdownV2', ...mainMenu }
+    );
 });
 
 // ─────────────────────────────────────────────
-// ТЕКСТОВЫЕ СООБЩЕНИЯ (поиск + выбор категории)
+// ТЕКСТОВЫЕ СООБЩЕНИЯ
 // ─────────────────────────────────────────────
 bot.on('text', async (ctx) => {
     const text = ctx.message.text;
     const state = ctx.session.state;
 
-    // Пользователь ввёл поисковый запрос
+    // Поиск внутри магазина
+    if (state === 'shop_search') {
+        ctx.session.query = text;
+        ctx.session.state = 'shop_mode';
+        await sendSearchResults(ctx, text, 0);
+        return;
+    }
+
+    // Поиск глобальный
     if (state === 'awaiting_search') {
         ctx.session.query = text;
         ctx.session.state = 'search_results';
@@ -112,7 +150,7 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // Пользователь выбрал категорию из клавиатуры
+    // Выбор категории
     if (state === 'catalog') {
         ctx.session.category = text;
         ctx.session.state = 'category_products';
@@ -120,51 +158,36 @@ bot.on('text', async (ctx) => {
         return;
     }
 
-    // Неизвестная команда
     await ctx.reply('Выберите действие из меню:', mainMenu);
 });
 
 // ─────────────────────────────────────────────
 // ИНЛАЙН КНОПКИ
 // ─────────────────────────────────────────────
-
-// Пагинация поиска
 bot.action(/^search_page_(\d+)$/, async (ctx) => {
     const page = parseInt(ctx.match[1]);
     await ctx.answerCbQuery();
     await sendSearchResults(ctx, ctx.session.query, page, true);
 });
 
-// Пагинация категории
 bot.action(/^cat_page_(\d+)$/, async (ctx) => {
     const page = parseInt(ctx.match[1]);
     await ctx.answerCbQuery();
     await sendCategoryProducts(ctx, ctx.session.category, page, true);
 });
 
-// Пагинация магазинов
 bot.action(/^shops_page_(\d+)$/, async (ctx) => {
     const page = parseInt(ctx.match[1]);
     await ctx.answerCbQuery();
     await sendVendorsList(ctx, page, true);
 });
 
-// Открыть карточку товара
 bot.action(/^product_(.+)$/, async (ctx) => {
     const productId = ctx.match[1];
     await ctx.answerCbQuery();
     await sendProductCard(ctx, productId);
 });
 
-// Открыть карточку магазина
-bot.action(/^shop_(.+)$/, async (ctx) => {
-    const slug = ctx.match[1];
-    if (slug.startsWith('products_')) return; // обрабатывается ниже
-    await ctx.answerCbQuery();
-    await sendShopCard(ctx, slug);
-});
-
-// Товары конкретного магазина
 bot.action(/^shop_products_(.+)$/, async (ctx) => {
     const slug = ctx.match[1];
     ctx.session.shopSlug = slug;
@@ -172,14 +195,18 @@ bot.action(/^shop_products_(.+)$/, async (ctx) => {
     await sendShopProducts(ctx, slug, 0, true);
 });
 
-// Пагинация товаров магазина
+bot.action(/^shop_(.+)$/, async (ctx) => {
+    const slug = ctx.match[1];
+    await ctx.answerCbQuery();
+    await sendShopCard(ctx, slug);
+});
+
 bot.action(/^shopcat_page_(\d+)$/, async (ctx) => {
     const page = parseInt(ctx.match[1]);
     await ctx.answerCbQuery();
     await sendShopProducts(ctx, ctx.session.shopSlug, page, true);
 });
 
-// Назад к списку товаров
 bot.action('back_to_list', async (ctx) => {
     await ctx.answerCbQuery();
     if (ctx.session.state === 'category_products') {
@@ -189,18 +216,38 @@ bot.action('back_to_list', async (ctx) => {
     }
 });
 
-// Назад к магазинам
 bot.action('back_to_shops', async (ctx) => {
     await ctx.answerCbQuery();
     await sendVendorsList(ctx, 0, true);
 });
 
-// Заглушка для кнопки страниц
 bot.action('noop', (ctx) => ctx.answerCbQuery());
 
 // ─────────────────────────────────────────────
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ─────────────────────────────────────────────
+
+async function sendShopWelcome(ctx, slug) {
+    const vendor = await getVendorBySlug(slug);
+    if (!vendor) {
+        return ctx.reply('😔 Магазин не найден\\.', { parse_mode: 'MarkdownV2', ...mainMenu });
+    }
+
+    const shopMenu = Markup.keyboard([
+        ['📦 Товары магазина', '🔍 Поиск товаров'],
+        ['🛍 Все магазины', '📞 Поддержка'],
+        ['⬅️ Главное меню']
+    ]).resize();
+
+    const text =
+        `🏪 *${escMd(vendor.name)}*\n\n` +
+        `Вы зашли через страницу этого магазина\\.\n` +
+        `📦 Товаров в наличии: *${vendor.product_count}*\n\n` +
+        `👇 Смотрите товары ниже:`;
+
+    await ctx.reply(text, { parse_mode: 'MarkdownV2', ...shopMenu });
+    await sendShopProducts(ctx, slug, 0);
+}
 
 async function sendSearchResults(ctx, query, page, edit = false) {
     if (!query) return;
@@ -213,7 +260,6 @@ async function sendSearchResults(ctx, query, page, edit = false) {
         formatProductList(products, page, total, perPage),
     ].join('\n');
 
-    // Инлайн кнопки с товарами + пагинация
     const productButtons = products.map(p =>
         [Markup.button.callback(
             `${p.title.slice(0, 35)}${p.title.length > 35 ? '…' : ''} — ${p.price.toLocaleString()} с.`,
@@ -269,15 +315,12 @@ async function sendProductCard(ctx, productId) {
     const text = formatProduct(product);
     const keyboard = productKeyboard(productId, process.env.SITE_URL);
 
-    // Если есть фото — отправляем с фото
     if (product.images && product.images.length > 0) {
         await ctx.replyWithPhoto(product.images[0], {
             caption: text,
             parse_mode: 'MarkdownV2',
             ...keyboard
-        }).catch(() =>
-            ctx.reply(text, { parse_mode: 'MarkdownV2', ...keyboard })
-        );
+        }).catch(() => ctx.reply(text, { parse_mode: 'MarkdownV2', ...keyboard }));
     } else {
         await ctx.reply(text, { parse_mode: 'MarkdownV2', ...keyboard });
     }
@@ -325,7 +368,6 @@ async function sendShopCard(ctx, slug) {
 
     const text = formatVendor(vendor);
     const keyboard = shopKeyboard(slug, process.env.SITE_URL);
-
     await ctx.reply(text, { parse_mode: 'MarkdownV2', ...keyboard });
 }
 
@@ -361,7 +403,6 @@ async function sendShopProducts(ctx, slug, page, edit = false) {
     }
 }
 
-// Строим ряд навигации (◀️ 1/3 ▶️)
 function buildNavRow(page, totalPages, prefix) {
     if (totalPages <= 1) return null;
     const buttons = [];
@@ -377,7 +418,6 @@ function buildNavRow(page, totalPages, prefix) {
 const PORT = process.env.PORT || 3000;
 
 if (process.env.WEBHOOK_URL) {
-    // Продакшн — webhook (Railway)
     await bot.telegram.setWebhook(`${process.env.WEBHOOK_URL}/webhook`);
     const { default: express } = await import('express');
     const app = express();
@@ -385,7 +425,6 @@ if (process.env.WEBHOOK_URL) {
     app.get('/', (_, res) => res.send('Oruk Market Bot is running ✅'));
     app.listen(PORT, () => console.log(`🚀 Bot webhook running on port ${PORT}`));
 } else {
-    // Разработка — long polling
     console.log('🤖 Bot started in polling mode');
     bot.launch();
 }
